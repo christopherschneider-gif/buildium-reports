@@ -57,7 +57,14 @@ from reportlab.platypus import (
 DAISY_GREEN = "#1B4332"       # hunter green (headers, sections)
 DAISY_CREAM = "#F5F5F0"       # light cream (alternating row shading)
 
-BUILDIUM_BASE = "https://api.buildium.com/v1"
+_CANONICAL_BUILDIUM_BASE = "https://api.buildium.com/v1"
+# Mutable at runtime via --api-base-url. When pointed at the public Buildium
+# API (the default), the script makes direct GETs with x-buildium-* headers.
+# When pointed at a proxy URL (e.g. Vercel /api/buildium-proxy), the script
+# wraps each GET into a POST {method, path, params} so the proxy can hold
+# the credentials server-side and the script never needs to know them.
+BUILDIUM_BASE = _CANONICAL_BUILDIUM_BASE
+_PROXY_MODE = False
 SCRIPT_DIR = Path(__file__).parent
 OUT_DIR = SCRIPT_DIR / "out"
 DAISY_LOGO_PATH = SCRIPT_DIR / "assets" / "daisy-logo.png"
@@ -1106,13 +1113,25 @@ _BASIS = "Cash"
 # --------------------------------------------------------------------------
 
 def load_credentials() -> dict[str, str]:
+    """
+    Build the Buildium auth header dict.
+
+    In proxy mode (--api-base-url pointed at the Vercel proxy), the proxy
+    holds the credentials server-side, so the local script doesn't need
+    them. We return an empty dict so callers don't have to special-case
+    this branch — the headers are simply not forwarded by _get_with_retries
+    when _PROXY_MODE is True (the proxy adds them).
+    """
+    if _PROXY_MODE:
+        return {"Accept": "application/json"}
     load_dotenv(SCRIPT_DIR / ".env")
     cid = os.environ.get("BUILDIUM_CLIENT_ID")
     cs = os.environ.get("BUILDIUM_CLIENT_SECRET")
     if not cid or not cs:
         sys.exit(
             "ERROR: BUILDIUM_CLIENT_ID and BUILDIUM_CLIENT_SECRET must be set "
-            "(in .env next to this script or in the process environment)."
+            "(in .env next to this script or in the process environment), "
+            "or run with --api-base-url <proxy-url> to use a server-side proxy."
         )
     return {
         "x-buildium-client-id": cid,
@@ -1128,13 +1147,40 @@ def _get_with_retries(
     GET with retries on transient errors (connection, 502/503/504). Each
     retry waits progressively longer. Returns the response regardless of
     status code -- caller decides what counts as success.
+
+    In proxy mode (BUILDIUM_BASE points at a Vercel proxy URL rather than
+    the canonical Buildium API), the GET is repackaged as a POST with body
+    {method, path, params} per the proxy's contract. The Buildium auth
+    headers are NOT forwarded — the proxy holds them server-side and adds
+    them on the way out.
     """
     import time
 
     last_exc: Exception | None = None
     for attempt in range(1, max_retries + 1):
         try:
-            r = requests.get(url, headers=headers, params=params, timeout=180)
+            if _PROXY_MODE:
+                # Strip the proxy base off the URL to recover the upstream
+                # Buildium path, then POST {method, path, params} to the proxy.
+                if url.startswith(BUILDIUM_BASE):
+                    upstream_path = url[len(BUILDIUM_BASE):].lstrip("/")
+                else:
+                    # Defensive — if a caller built a URL by other means,
+                    # treat the whole url as the path. Should not happen.
+                    upstream_path = url.lstrip("/")
+                proxy_body = {
+                    "method": "GET",
+                    "path": upstream_path,
+                    "params": params or {},
+                }
+                r = requests.post(
+                    BUILDIUM_BASE,
+                    json=proxy_body,
+                    headers={"Accept": "application/json"},
+                    timeout=180,
+                )
+            else:
+                r = requests.get(url, headers=headers, params=params, timeout=180)
             if r.status_code in (429, 502, 503, 504) and attempt < max_retries:
                 # 429 (rate limit) needs a longer cool-down than transient 5xx.
                 retry_after = r.headers.get("Retry-After")
@@ -5516,11 +5562,37 @@ def main() -> int:
             "only when a CPA explicitly requests accrual reporting."
         ),
     )
+    parser.add_argument(
+        "--api-base-url",
+        default=_CANONICAL_BUILDIUM_BASE,
+        help=(
+            "Override the Buildium API base URL. Default is the canonical "
+            "https://api.buildium.com/v1 (direct calls with x-buildium-* "
+            "headers from .env). Pass a proxy URL like "
+            "https://daisy-finance.vercel.app/api/buildium-proxy to route "
+            "through a Vercel proxy that holds the credentials server-side; "
+            "in that mode the script never needs BUILDIUM_CLIENT_ID/SECRET "
+            "locally and each upstream GET is wrapped in a POST with body "
+            "{method, path, params}."
+        ),
+    )
     args = parser.parse_args()
 
     # Make --basis visible to every fetcher and writer via the module global.
     global _BASIS
     _BASIS = args.basis
+
+    # Wire the API base + proxy mode flag before any HTTP happens. Both are
+    # module-level so _get_with_retries / load_credentials can branch on them
+    # without threading the value through every caller.
+    global BUILDIUM_BASE, _PROXY_MODE
+    BUILDIUM_BASE = args.api_base_url.rstrip("/")
+    _PROXY_MODE = (BUILDIUM_BASE != _CANONICAL_BUILDIUM_BASE)
+    if _PROXY_MODE:
+        print(
+            f"API mode: PROXY ({BUILDIUM_BASE}) — credentials held by the proxy",
+            flush=True,
+        )
 
     if args.report_type == "owner_statement" and args.ownership_account_id is None:
         sys.exit(
